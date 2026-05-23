@@ -1,7 +1,28 @@
-import { IsArray, IsOptional, IsString } from 'class-validator';
+import {
+  IsArray,
+  IsInt,
+  IsOptional,
+  IsString,
+  Max,
+  Min,
+  ArrayMaxSize,
+} from 'class-validator';
+import { Type } from 'class-transformer';
 
 export class BotSearchProductoDto {
-  producto: string;
+  @IsOptional()
+  @IsString()
+  producto?: string | null;
 
-  categorias?: string[];
+  @IsArray()
+  @IsString({ each: true })
+  @ArrayMaxSize(25)
+  categorias: string[];
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(80)
+  limit?: number | null;
 }
