@@ -1,17 +1,12 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from 'src/prisma/prisma.service';
+import { BotListarCatalogoDto } from '../dto/listar-producto-pos';
 
 type BotSearchProductoDto = {
   producto?: string | null;
   categorias: string[];
   limit?: number | null;
-};
-
-type BotListarCatalogoDto = {
-  consulta?: string | null;
-  limit?: number | null;
-  incluirEjemplos?: boolean | null;
 };
 
 @Injectable()
@@ -21,27 +16,78 @@ export class BotFunctionsService {
   constructor(private readonly prisma: PrismaService) {}
 
   async search(dto: BotSearchProductoDto) {
+    const traceId = `POS_SEARCH_${Date.now()}_${Math.random()
+      .toString(36)
+      .slice(2, 8)}`;
+
     try {
       this.logger.log(
-        `DTO buscar_producto_en_pos:\n${JSON.stringify(dto, null, 2)}`,
+        `[${traceId}] DTO buscar_producto_en_pos RAW:\n${JSON.stringify(
+          dto,
+          null,
+          2,
+        )}`,
       );
 
       const producto = this.cleanText(dto.producto ?? '');
+
       const categorias = Array.isArray(dto.categorias)
         ? dto.categorias.map((c) => this.cleanText(c)).filter(Boolean)
         : [];
 
-      const limit = this.normalizeLimit(dto.limit, 30, 80);
+      /**
+       * Subimos el límite un poco porque el bot puede necesitar ver más opciones:
+       * - iPhone
+       * - cables iPhone
+       * - cubos iPhone
+       * - vidrios iPhone
+       * - accesorios Apple/iPhone
+       *
+       * Ojo: no lo subas demasiado o puedes saturar tokens.
+       */
+      const limit = this.normalizeLimit(dto.limit, 50, 120);
 
-      const rawTerms = this.unique([
+      /**
+       * VANILLA:
+       * No usamos expandGenericTerms().
+       *
+       * Mantenemos:
+       * - frase completa: "iphone 13", "celular iphone", "samsung a06"
+       * - tokens: "iphone", "13", "samsung", "a06"
+       * - categorías tal como las mandó el bot
+       */
+      const phraseTerms = this.unique([producto, ...categorias]).filter(
+        Boolean,
+      );
+
+      const tokenTerms = this.unique([
         ...this.tokenize(producto),
-        ...categorias,
         ...categorias.flatMap((c) => this.tokenize(c)),
       ]);
 
-      const terms = this.expandGenericTerms(rawTerms);
+      const terms = this.unique([...phraseTerms, ...tokenTerms]).slice(0, 80);
+
+      this.logger.log(
+        `[${traceId}] QUERY NORMALIZADA:\n${JSON.stringify(
+          {
+            productoOriginal: dto.producto ?? null,
+            productoClean: producto,
+            categoriasOriginales: dto.categorias ?? [],
+            categoriasClean: categorias,
+            phraseTerms,
+            tokenTerms,
+            termsFinales: terms,
+            limit,
+          },
+          null,
+          2,
+        )}`,
+      );
 
       if (!terms.length) {
+        this.logger.warn(
+          `[${traceId}] Sin términos de búsqueda. Retornando [].`,
+        );
         return [];
       }
 
@@ -58,10 +104,21 @@ export class BotFunctionsService {
           id: true,
           nombre: true,
         },
-        take: 80,
+        take: 120,
       });
 
       const matchedCategoriaIds = matchedCategorias.map((cat) => cat.id);
+
+      this.logger.log(
+        `[${traceId}] CATEGORIAS MATCH:\n${JSON.stringify(
+          matchedCategorias.map((cat) => ({
+            id: cat.id,
+            nombre: cat.nombre,
+          })),
+          null,
+          2,
+        )}`,
+      );
 
       const OR: Prisma.ProductoWhereInput[] = [
         ...terms.map((term) => ({
@@ -106,17 +163,46 @@ export class BotFunctionsService {
         });
       }
 
+      /**
+       * IMPORTANTE:
+       * No filtramos por stock.
+       * Solo pedimos producto activo y no eliminado.
+       *
+       * Esto permite que el bot vea productos sin existencia,
+       * pero que igual puede ofrecer para pedido/apartado.
+       */
+      const where: Prisma.ProductoWhereInput = {
+        activo: true,
+        eliminado: false,
+        OR,
+      };
+
+      const fetchLimit = Math.min(Math.max(limit * 6, 300), 700);
+
+      this.logger.log(
+        `[${traceId}] WHERE RESUMEN:\n${JSON.stringify(
+          {
+            activo: true,
+            eliminado: false,
+            totalTerms: terms.length,
+            totalCondicionesOR: OR.length,
+            matchedCategoriaIds,
+            fetchLimit,
+          },
+          null,
+          2,
+        )}`,
+      );
+
       const productos = await this.prisma.producto.findMany({
-        where: {
-          activo: true,
-          eliminado: false,
-          OR,
-        },
+        where,
         select: {
           id: true,
           nombre: true,
           descripcion: true,
           codigoProducto: true,
+          activo: true,
+          eliminado: true,
           categorias: {
             select: {
               nombre: true,
@@ -142,10 +228,36 @@ export class BotFunctionsService {
             },
           },
         },
-        take: Math.max(limit * 4, 80),
+        orderBy: {
+          nombre: 'asc',
+        },
+        take: fetchLimit,
       });
 
-      return productos
+      this.logger.log(
+        `[${traceId}] PRODUCTOS RAW ENCONTRADOS EN DB: ${productos.length}`,
+      );
+
+      this.logger.log(
+        `[${traceId}] PRODUCTOS RAW PREVIEW:\n${JSON.stringify(
+          productos.slice(0, 120).map((p) => ({
+            id: p.id,
+            nombre: p.nombre,
+            codigoProducto: p.codigoProducto,
+            precio: Number(p.precios?.[0]?.precio ?? 0),
+            categorias: p.categorias.map((cat) => cat.nombre),
+            stockTotalRaw: p.stock.reduce((acc, s) => acc + s.cantidad, 0),
+            stockPorSucursal: p.stock.map((s) => ({
+              sucursal: s.sucursal.nombre,
+              cantidad: s.cantidad,
+            })),
+          })),
+          null,
+          2,
+        )}`,
+      );
+
+      const resultados = productos
         .map((prod) => {
           const cantidadDisponible = prod.stock.reduce(
             (acc, stock) => {
@@ -175,56 +287,115 @@ export class BotFunctionsService {
           return {
             id: prod.id,
             nombre: prod.nombre,
+            codigoProducto: prod.codigoProducto,
             precio: Number(prod.precios?.[0]?.precio ?? 0),
             cantidadDisponible,
             totalDisponible,
+            inventarioEstado:
+              totalDisponible > 0 ? 'CON_STOCK' : 'SIN_STOCK_PARA_PEDIDO',
             categorias: categoriasProducto,
             score,
           };
         })
-        .filter((prod) => prod.totalDisponible > 0)
+        /**
+         * Ya NO filtramos por stock.
+         * Antes tenías:
+         * .filter((prod) => prod.totalDisponible > 0)
+         *
+         * Eso era parte del problema.
+         */
         .sort((a, b) => {
           if (b.score !== a.score) return b.score - a.score;
           return b.totalDisponible - a.totalDisponible;
         })
         .slice(0, limit);
+
+      this.logger.log(
+        `[${traceId}] PRODUCTOS FINALES ENVIADOS AL BOT: ${resultados.length}`,
+      );
+
+      this.logger.log(
+        `[${traceId}] PRODUCTOS FINALES PREVIEW:\n${JSON.stringify(
+          resultados.map((p) => ({
+            id: p.id,
+            nombre: p.nombre,
+            codigoProducto: p.codigoProducto,
+            precio: p.precio,
+            totalDisponible: p.totalDisponible,
+            inventarioEstado: p.inventarioEstado,
+            categorias: p.categorias,
+            score: p.score,
+          })),
+          null,
+          2,
+        )}`,
+      );
+
+      return resultados;
     } catch (error) {
-      this.logger.error('Error en buscar_producto_en_pos', error);
+      this.logger.error(`[${traceId}] Error en buscar_producto_en_pos`, error);
       throw error;
     }
   }
 
   async listarCatalogo(dto: BotListarCatalogoDto) {
+    const traceId = `POS_CATALOGO_${Date.now()}_${Math.random()
+      .toString(36)
+      .slice(2, 8)}`;
+
     try {
       this.logger.log(
-        `DTO listar_catalogo_pos:\n${JSON.stringify(dto, null, 2)}`,
+        `[${traceId}] DTO listar_catalogo_pos RAW:\n${JSON.stringify(
+          dto,
+          null,
+          2,
+        )}`,
       );
 
       const consulta = this.cleanText(dto.consulta ?? '');
-      const terms = this.expandGenericTerms(this.tokenize(consulta));
-      const limit = this.normalizeLimit(dto.limit, 20, 60);
+      const limit = this.normalizeLimit(dto.limit, 20, 80);
       const incluirEjemplos = dto.incluirEjemplos ?? true;
 
-      const productosDisponiblesWhere: Prisma.ProductoWhereInput = {
+      /**
+       * VANILLA:
+       * No usamos expandGenericTerms().
+       * Para catálogo/listado dejamos solo lo que el bot mandó:
+       * - frase completa
+       * - tokens reales
+       */
+      const phraseTerms = this.unique([consulta]).filter(Boolean);
+
+      const tokenTerms = this.unique(this.tokenize(consulta));
+
+      const terms = this.unique([...phraseTerms, ...tokenTerms]).slice(0, 60);
+
+      this.logger.log(
+        `[${traceId}] QUERY NORMALIZADA:\n${JSON.stringify(
+          {
+            consultaOriginal: dto.consulta ?? null,
+            consultaClean: consulta,
+            phraseTerms,
+            tokenTerms,
+            termsFinales: terms,
+            limit,
+            incluirEjemplos,
+          },
+          null,
+          2,
+        )}`,
+      );
+
+      const productoBaseWhere: Prisma.ProductoWhereInput = {
         activo: true,
         eliminado: false,
-        stock: {
-          some: {
-            cantidad: {
-              gt: 0,
-            },
-          },
-        },
       };
 
-      const where: Prisma.CategoriaWhereInput = {
-        productos: {
-          some: productosDisponiblesWhere,
-        },
+      const productoSearchWhere: Prisma.ProductoWhereInput = {
+        ...productoBaseWhere,
       };
 
       if (terms.length) {
-        where.OR = [
+        productoSearchWhere.OR = [
           ...terms.map((term) => ({
             nombre: {
               contains: term,
@@ -232,150 +403,265 @@ export class BotFunctionsService {
             },
           })),
           ...terms.map((term) => ({
-            productos: {
+            descripcion: {
+              contains: term,
+              mode: Prisma.QueryMode.insensitive,
+            },
+          })),
+          ...terms.map((term) => ({
+            codigoProducto: {
+              contains: term,
+              mode: Prisma.QueryMode.insensitive,
+            },
+          })),
+          ...terms.map((term) => ({
+            categorias: {
               some: {
-                ...productosDisponiblesWhere,
-                OR: [
-                  {
-                    nombre: {
-                      contains: term,
-                      mode: Prisma.QueryMode.insensitive,
-                    },
-                  },
-                  {
-                    descripcion: {
-                      contains: term,
-                      mode: Prisma.QueryMode.insensitive,
-                    },
-                  },
-                  {
-                    codigoProducto: {
-                      contains: term,
-                      mode: Prisma.QueryMode.insensitive,
-                    },
-                  },
-                ],
+                nombre: {
+                  contains: term,
+                  mode: Prisma.QueryMode.insensitive,
+                },
               },
             },
           })),
         ];
       }
 
-      const select = {
-        id: true,
-        nombre: true,
-        _count: {
-          select: {
-            productos: {
-              where: productosDisponiblesWhere,
+      /**
+       * Si hay consulta, primero buscamos productos relacionados.
+       * Esto permite que una búsqueda como "iphone" encuentre:
+       * - celulares iPhone
+       * - cables iPhone
+       * - cubos iPhone
+       * - vidrios iPhone
+       * - accesorios relacionados
+       *
+       * No importa si tienen stock o no.
+       */
+      const productosLimit = Math.min(Math.max(limit * 10, 200), 600);
+
+      const productos = await this.prisma.producto.findMany({
+        where: productoSearchWhere,
+        select: {
+          id: true,
+          nombre: true,
+          descripcion: true,
+          codigoProducto: true,
+          activo: true,
+          eliminado: true,
+          categorias: {
+            select: {
+              id: true,
+              nombre: true,
+            },
+          },
+          precios: {
+            take: 1,
+            orderBy: {
+              orden: 'desc',
+            },
+            select: {
+              precio: true,
+            },
+          },
+          stock: {
+            select: {
+              cantidad: true,
+              sucursal: {
+                select: {
+                  nombre: true,
+                },
+              },
             },
           },
         },
-        ...(incluirEjemplos
-          ? {
-              productos: {
-                where: productosDisponiblesWhere,
-                select: {
-                  id: true,
-                  nombre: true,
-                  precios: {
-                    take: 1,
-                    orderBy: {
-                      orden: 'desc' as const,
-                    },
-                    select: {
-                      precio: true,
-                    },
-                  },
-                  stock: {
-                    select: {
-                      cantidad: true,
-                      sucursal: {
-                        select: {
-                          nombre: true,
-                        },
-                      },
-                    },
-                  },
-                },
-                take: 5,
-              },
-            }
-          : {}),
-      } satisfies Prisma.CategoriaSelect;
-
-      if (incluirEjemplos) {
-        select.productos = {
-          where: productosDisponiblesWhere,
-          select: {
-            id: true,
-            nombre: true,
-            precios: {
-              take: 1,
-              orderBy: {
-                orden: 'desc',
-              },
-              select: {
-                precio: true,
-              },
-            },
-            stock: {
-              select: {
-                cantidad: true,
-                sucursal: {
-                  select: {
-                    nombre: true,
-                  },
-                },
-              },
-            },
-          },
-          take: 5,
-        };
-      }
-
-      const categorias = await this.prisma.categoria.findMany({
-        where,
-        select,
         orderBy: {
           nombre: 'asc',
         },
-        take: limit,
+        take: productosLimit,
       });
 
-      return categorias
-        .map((cat) => ({
+      this.logger.log(
+        `[${traceId}] PRODUCTOS RAW PARA CATALOGO: ${productos.length}`,
+      );
+
+      this.logger.log(
+        `[${traceId}] PRODUCTOS RAW PREVIEW:\n${JSON.stringify(
+          productos.slice(0, 120).map((p) => ({
+            id: p.id,
+            nombre: p.nombre,
+            codigoProducto: p.codigoProducto,
+            categorias: p.categorias.map((cat) => cat.nombre),
+            precio: Number(p.precios?.[0]?.precio ?? 0),
+            totalDisponible: p.stock.reduce((acc, s) => acc + s.cantidad, 0),
+          })),
+          null,
+          2,
+        )}`,
+      );
+
+      const productosFormateados = productos.map((prod) => {
+        const cantidadDisponible = prod.stock.reduce<Record<string, number>>(
+          (acc, stock) => {
+            const sucursal = stock.sucursal.nombre;
+            acc[sucursal] = (acc[sucursal] ?? 0) + stock.cantidad;
+            return acc;
+          },
+          {},
+        );
+
+        const totalDisponible = Object.values(cantidadDisponible).reduce(
+          (acc, cantidad) => acc + cantidad,
+          0,
+        );
+
+        const categorias = prod.categorias.map((cat) => ({
           id: cat.id,
           nombre: cat.nombre,
-          totalProductosDisponibles: cat._count.productos,
-          ejemplos:
-            'productos' in cat && Array.isArray(cat.productos)
-              ? cat.productos.map((prod) => {
-                  const cantidadDisponible = prod.stock.reduce<
-                    Record<string, number>
-                  >((acc, stock) => {
-                    const sucursal = stock.sucursal.nombre;
-                    acc[sucursal] = (acc[sucursal] ?? 0) + stock.cantidad;
-                    return acc;
-                  }, {});
+        }));
 
-                  const totalDisponible = Object.values(
-                    cantidadDisponible,
-                  ).reduce<number>((acc, cantidad) => acc + cantidad, 0);
+        const score = this.scoreProduct({
+          nombre: prod.nombre,
+          descripcion: prod.descripcion ?? '',
+          codigoProducto: prod.codigoProducto,
+          categorias: categorias.map((cat) => cat.nombre),
+          terms,
+          totalDisponible,
+        });
 
-                  return {
-                    id: prod.id,
-                    nombre: prod.nombre,
-                    precio: Number(prod.precios?.[0]?.precio ?? 0),
-                    cantidadDisponible,
-                    totalDisponible,
-                  };
-                })
-              : [],
-        }))
-        .filter((cat) => cat.totalProductosDisponibles > 0);
+        return {
+          id: prod.id,
+          nombre: prod.nombre,
+          codigoProducto: prod.codigoProducto,
+          precio: Number(prod.precios?.[0]?.precio ?? 0),
+          totalDisponible,
+          cantidadDisponible,
+          inventarioEstado:
+            totalDisponible > 0 ? 'CON_STOCK' : 'SIN_STOCK_PARA_PEDIDO',
+          categorias,
+          score,
+        };
+      });
+
+      /**
+       * Agrupamos por categoría
+       */
+      const categoriasMap = new Map<
+        number,
+        {
+          id: number;
+          nombre: string;
+          productos: typeof productosFormateados;
+        }
+      >();
+
+      for (const producto of productosFormateados) {
+        if (!producto.categorias.length) {
+          const uncategorizedId = 0;
+
+          if (!categoriasMap.has(uncategorizedId)) {
+            categoriasMap.set(uncategorizedId, {
+              id: uncategorizedId,
+              nombre: 'Sin categoría',
+              productos: [],
+            });
+          }
+
+          categoriasMap.get(uncategorizedId)!.productos.push(producto);
+          continue;
+        }
+
+        for (const categoria of producto.categorias) {
+          if (!categoriasMap.has(categoria.id)) {
+            categoriasMap.set(categoria.id, {
+              id: categoria.id,
+              nombre: categoria.nombre,
+              productos: [],
+            });
+          }
+
+          categoriasMap.get(categoria.id)!.productos.push(producto);
+        }
+      }
+
+      const categorias = Array.from(categoriasMap.values())
+        .map((categoria) => {
+          const productosOrdenados = categoria.productos
+            .sort((a, b) => {
+              if (b.score !== a.score) return b.score - a.score;
+              if (b.totalDisponible !== a.totalDisponible) {
+                return b.totalDisponible - a.totalDisponible;
+              }
+              return a.nombre.localeCompare(b.nombre);
+            })
+            .slice(0, incluirEjemplos ? 12 : 0)
+            .map((prod) => ({
+              id: prod.id,
+              nombre: prod.nombre,
+              codigoProducto: prod.codigoProducto,
+              precio: prod.precio,
+              totalDisponible: prod.totalDisponible,
+              cantidadDisponible: prod.cantidadDisponible,
+              inventarioEstado: prod.inventarioEstado,
+            }));
+
+          const totalConStock = categoria.productos.filter(
+            (p) => p.totalDisponible > 0,
+          ).length;
+
+          const totalParaPedido = categoria.productos.filter(
+            (p) => p.totalDisponible <= 0,
+          ).length;
+
+          return {
+            tipoResultado: 'categoria_catalogo',
+            categoria: {
+              id: categoria.id,
+              nombre: categoria.nombre,
+            },
+            totalProductosRelacionados: categoria.productos.length,
+            totalConStock,
+            totalParaPedido,
+            ejemplos: productosOrdenados,
+          };
+        })
+        .filter((cat) => cat.totalProductosRelacionados > 0)
+        .sort((a, b) => {
+          if (b.totalProductosRelacionados !== a.totalProductosRelacionados) {
+            return b.totalProductosRelacionados - a.totalProductosRelacionados;
+          }
+
+          return a.categoria.nombre.localeCompare(b.categoria.nombre);
+        })
+        .slice(0, limit);
+
+      this.logger.log(
+        `[${traceId}] CATEGORIAS FINALES PARA BOT: ${categorias.length}`,
+      );
+
+      this.logger.log(
+        `[${traceId}] CATALOGO FINAL PREVIEW:\n${JSON.stringify(
+          categorias.map((cat) => ({
+            categoria: cat.categoria.nombre,
+            totalProductosRelacionados: cat.totalProductosRelacionados,
+            totalConStock: cat.totalConStock,
+            totalParaPedido: cat.totalParaPedido,
+            ejemplos: cat.ejemplos.slice(0, 8).map((p) => ({
+              id: p.id,
+              nombre: p.nombre,
+              precio: p.precio,
+              totalDisponible: p.totalDisponible,
+              inventarioEstado: p.inventarioEstado,
+            })),
+          })),
+          null,
+          2,
+        )}`,
+      );
+
+      return categorias;
     } catch (error) {
-      this.logger.error('Error en listar_catalogo_pos', error);
+      this.logger.error(`[${traceId}] Error en listar_catalogo_pos`, error);
       throw error;
     }
   }
@@ -406,72 +692,6 @@ export class BotFunctionsService {
   ): number {
     if (!limit || Number.isNaN(limit)) return fallback;
     return Math.min(Math.max(Math.trunc(limit), 1), max);
-  }
-
-  private expandGenericTerms(terms: string[]): string[] {
-    const synonyms: Record<string, string[]> = {
-      telefono: [
-        'telefono',
-        'telefonos',
-        'celular',
-        'celulares',
-        'smartphone',
-        'movil',
-      ],
-      telefonos: [
-        'telefono',
-        'telefonos',
-        'celular',
-        'celulares',
-        'smartphone',
-        'movil',
-      ],
-      celular: [
-        'telefono',
-        'telefonos',
-        'celular',
-        'celulares',
-        'smartphone',
-        'movil',
-      ],
-      celulares: [
-        'telefono',
-        'telefonos',
-        'celular',
-        'celulares',
-        'smartphone',
-        'movil',
-      ],
-      movil: [
-        'telefono',
-        'telefonos',
-        'celular',
-        'celulares',
-        'smartphone',
-        'movil',
-      ],
-
-      computadora: ['computadora', 'computadoras', 'laptop', 'laptops', 'pc'],
-      computadoras: ['computadora', 'computadoras', 'laptop', 'laptops', 'pc'],
-      laptop: ['computadora', 'computadoras', 'laptop', 'laptops', 'pc'],
-      laptops: ['computadora', 'computadoras', 'laptop', 'laptops', 'pc'],
-
-      protector: ['protector', 'protectores', 'case', 'funda', 'estuche'],
-      protectores: ['protector', 'protectores', 'case', 'funda', 'estuche'],
-
-      cargador: ['cargador', 'cargadores', 'cable', 'adaptador'],
-      cargadores: ['cargador', 'cargadores', 'cable', 'adaptador'],
-    };
-
-    const expanded = terms.flatMap((term) => {
-      const clean = this.cleanText(term);
-      const singular = clean.endsWith('s') ? clean.slice(0, -1) : clean;
-      const plural = clean.endsWith('s') ? clean : `${clean}s`;
-
-      return [clean, singular, plural, ...(synonyms[clean] ?? [])];
-    });
-
-    return this.unique(expanded).slice(0, 60);
   }
 
   private scoreProduct(params: {
