@@ -15,6 +15,7 @@ import { CreateBotFunctionDto } from '../dto/create-bot-function.dto';
 import { UpdateBotFunctionDto } from '../dto/update-bot-function.dto';
 import { ConfigService } from '@nestjs/config';
 import { BotSearchProductoDto } from '../dto/searchDto.dto';
+import { BotListarCatalogoDto } from '../dto/listar-producto-pos';
 // bot-functions/make-search-products
 @Controller('bot-functions')
 export class BotFunctionsController {
@@ -39,5 +40,20 @@ export class BotFunctionsController {
     }
 
     return this.botFunctionsService.search(dto);
+  }
+
+  @Post('listar-productos-pos')
+  listar_productos_pos(
+    @Body() dto: BotListarCatalogoDto,
+    @Headers('x-internal-secret') secretKey: string,
+    // @Req() req: Request,
+  ) {
+    const INTERNAL_SECRET = this.config.get('INTERNAL_SECRET');
+
+    if (INTERNAL_SECRET !== secretKey) {
+      throw new UnauthorizedException('TOKEN NO AUTORIZADO');
+    }
+
+    return this.botFunctionsService.listarCatalogo(dto);
   }
 }
