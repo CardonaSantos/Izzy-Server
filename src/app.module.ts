@@ -88,6 +88,9 @@ import { PeriodosModule } from './control-presupuestal/periodos/periodos.module'
 import { CuentaContableModule } from './contabilidad/cuenta-contable/cuenta-contable.module';
 import { AsientoContableModule } from './contabilidad/asiento-contable/asiento-contable.module';
 import { ReglaContableModule } from './contabilidad/regla-contable/regla-contable.module';
+import { CloudApiMetaModule } from './cloud-api-meta/cloud-api-meta.module';
+import { WhatsappCampaignsModule } from './whatsapp-campaigns/whatsapp-campaigns.module';
+import { WhatsappTemplateModule } from './whatsapp-template/whatsapp-template.module';
 
 @Module({
   imports: [
@@ -178,6 +181,9 @@ import { ReglaContableModule } from './contabilidad/regla-contable/regla-contabl
     CuentaContableModule,
     AsientoContableModule,
     ReglaContableModule,
+    CloudApiMetaModule,
+    WhatsappCampaignsModule,
+    WhatsappTemplateModule,
   ],
   controllers: [AppController],
   providers: [AppService, CloudinaryProvider, SaldosServiceService],
