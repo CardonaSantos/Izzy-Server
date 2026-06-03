@@ -29,6 +29,8 @@ export class SendWhatsappCampaignDto {
   templateId: string;
   templateName: string;
   templateLanguage: string;
+  headerImageUrl?: string;
+
   templateCategory: WhatsappTemplateCategory | string;
 
   sendMode: WhatsappCampaignSendMode;

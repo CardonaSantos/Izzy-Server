@@ -36,6 +36,8 @@ export class WhatsappCampaignsService {
     const results = [];
 
     for (const recipient of validRecipients) {
+      const components = this.buildTemplateComponents(dto);
+
       const metaPayload: WhatsAppTemplatePayload = {
         messaging_product: 'whatsapp',
         to: recipient.phone,
@@ -45,6 +47,7 @@ export class WhatsappCampaignsService {
           language: {
             code: dto.templateLanguage,
           },
+          ...(components ? { components } : {}),
         },
       };
 
@@ -113,5 +116,24 @@ export class WhatsappCampaignsService {
   private getErrorMessage(error: unknown): string {
     if (error instanceof Error) return error.message;
     return 'Error desconocido enviando mensaje';
+  }
+  private buildTemplateComponents(dto: SendWhatsappCampaignDto) {
+    const components: WhatsAppTemplatePayload['template']['components'] = [];
+
+    if (dto.headerImageUrl?.trim()) {
+      components.push({
+        type: 'header',
+        parameters: [
+          {
+            type: 'image',
+            image: {
+              link: dto.headerImageUrl.trim(),
+            },
+          },
+        ],
+      });
+    }
+
+    return components.length > 0 ? components : undefined;
   }
 }
