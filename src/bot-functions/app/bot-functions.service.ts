@@ -210,6 +210,9 @@ export class BotFunctionsService {
           },
           precios: {
             take: 1,
+            where: {
+              orden: 1,
+            },
             orderBy: {
               orden: 'desc',
             },
@@ -457,6 +460,9 @@ export class BotFunctionsService {
           },
           precios: {
             take: 1,
+            where: {
+              orden: 1,
+            },
             orderBy: {
               orden: 'desc',
             },
