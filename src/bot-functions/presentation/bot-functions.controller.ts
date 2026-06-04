@@ -33,12 +33,6 @@ export class BotFunctionsController {
     console.log('RAW BODY:', req.body);
     console.log('DTO TRANSFORMADO:', dto);
 
-    const INTERNAL_SECRET = this.config.get('INTERNAL_SECRET');
-
-    if (INTERNAL_SECRET !== secretKey) {
-      throw new UnauthorizedException('TOKEN NO AUTORIZADO');
-    }
-
     return this.botFunctionsService.search(dto);
   }
 
