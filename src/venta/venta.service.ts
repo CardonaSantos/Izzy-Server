@@ -79,16 +79,11 @@ export class VentaService {
       `DTO recibido en generar ventas:\n${JSON.stringify(createVentaDto, null, 2)}`,
     );
 
-    // ------------------------------------------------------------------
-    // 0) Rol real del actor + política de caja
-    // ------------------------------------------------------------------
     const actorReal = await tx.usuario.findUnique({
       where: { id: usuarioId },
       select: { rol: true },
     });
     const rolEjecutor: Rol = actorReal?.rol ?? 'VENDEDOR';
-    // OJO: el método real puede modificarse más abajo al crear el pago,
-    // por eso recalcularemos la bandera después del pago también si hace falta.
     let metodoReal: MetodoPago = metodoPago;
 
     const referenciaPagoValid =
@@ -97,17 +92,11 @@ export class VentaService {
         : null;
 
     try {
-      // ----------------------------------------------------------------
-      // 1) Usuarios destinatarios de notificaciones (sin cambios)
-      // ----------------------------------------------------------------
       const usuariosNotif = await tx.usuario.findMany({
         where: { rol: { in: ['ADMIN', 'VENDEDOR'] } },
       });
       const usuariosNotifIds = usuariosNotif.map((u) => u.id);
 
-      // ----------------------------------------------------------------
-      // 2) Cliente: conectar o crear rápido (sin cambios)
-      // ----------------------------------------------------------------
       let clienteConnect: { connect: { id: number } } | undefined;
       if (clienteId) {
         clienteConnect = { connect: { id: clienteId } };
@@ -124,10 +113,6 @@ export class VentaService {
         clienteConnect = { connect: { id: nuevo.id } };
       }
 
-      // ----------------------------------------------------------------
-      // 3) Validación de líneas vs precio seleccionado (igual que antes)
-      //    y obtención de lineas Producto/Presentación consolidadas
-      // ----------------------------------------------------------------
       const prodValidadas: LineaProd[] = [];
       const presValidadas: LineaPres[] = [];
       type LineaEntrada = (typeof productos)[number];
@@ -211,7 +196,6 @@ export class VentaService {
         );
       }
 
-      // Consolidar (productoId,selectedPriceId) y (presentacionId,selectedPriceId)
       const keyProd = (x: LineaProd) => `${x.productoId}|${x.selectedPriceId}`;
       const keyPres = (x: LineaPres) =>
         `${x.presentacionId}|${x.selectedPriceId}`;
@@ -234,9 +218,6 @@ export class VentaService {
       }
       const presConsolidadas = Array.from(mapPres.values());
 
-      // ----------------------------------------------------------------
-      // 4) Snapshot de stock anterior (sin cambios)
-      // ----------------------------------------------------------------
       const cantidadesAnterioresProd: Record<number, number> = {};
       const unicProdIds = Array.from(
         new Set(prodConsolidadas.map((x) => x.productoId)),
@@ -261,8 +242,6 @@ export class VentaService {
         cantidadesAnterioresPres[prId] = agg._sum.cantidadPresentacion ?? 0;
       }
 
-      // PRECIOS TEMPORALES ---->
-      // 4.1 — Reclamar precios temporales
       const allSelectedIds = Array.from(
         new Set([
           ...prodConsolidadas.map((x) => x.selectedPriceId),
@@ -270,9 +249,7 @@ export class VentaService {
         ]),
       );
 
-      // si no hay precios seleccionados, evita ir a DB
       if (allSelectedIds.length) {
-        // Filtra solo precios temporales aprobados
         const temporales = await tx.precioProducto.findMany({
           where: {
             id: { in: allSelectedIds },
@@ -282,7 +259,6 @@ export class VentaService {
           select: { id: true, usado: true },
         });
 
-        // Si ya viene alguno usado, aborta
         if (temporales.some((p) => p.usado)) {
           throw new BadRequestException(
             'Uno de los precios temporales ya fue usado.',
@@ -292,32 +268,19 @@ export class VentaService {
         const idsTemporales = temporales.map((p) => p.id);
 
         if (idsTemporales.length) {
-          // Reclamo atómico: solo marcará si usado=false
           const { count } = await tx.precioProducto.updateMany({
             where: { id: { in: idsTemporales }, usado: false },
             data: { usado: true },
           });
 
-          // Si alguien más lo “ganó” entre el find y el updateMany, count no cuadra
           if (count !== idsTemporales.length) {
             throw new BadRequestException(
               'Colisión de concurrencia: un precio temporal ya fue utilizado por otra venta.',
             );
           }
-
-          // >>> Continúa con stock FIFO, totales, etc. <<<
-
-          // (Opcional) tras crear la venta, deja rastro:
-          // await tx.precioProducto.updateMany({
-          //   where: { id: { in: idsTemporales } },
-          //   data: { consumidoEnVentaId: venta.id }, // si añades esta columna al schema
-          // });
         }
       }
 
-      // ----------------------------------------------------------------
-      // 5) Descontar STOCK FIFO (producto + presentacion) (sin cambios)
-      // ----------------------------------------------------------------
       for (const linea of prodConsolidadas) {
         let restante = linea.cantidad;
         const lotes = await tx.stock.findMany({
@@ -370,9 +333,6 @@ export class VentaService {
         }
       }
 
-      // ----------------------------------------------------------------
-      // 6) Notificaciones de stock bajo (igual que antes)
-      // ----------------------------------------------------------------
       for (const prodId of unicProdIds) {
         const [agg, th, info] = await Promise.all([
           tx.stock.aggregate({
@@ -427,10 +387,6 @@ export class VentaService {
           });
         }
       }
-
-      // ----------------------------------------------------------------
-      // 7) Totales (sin cambios)
-      // ----------------------------------------------------------------
       const totalVentaProd = prodConsolidadas.reduce(
         (sum, x) => sum.add(x.precioVenta.mul(x.cantidad)),
         new Prisma.Decimal(0),
@@ -441,9 +397,6 @@ export class VentaService {
       );
       const totalVenta = totalVentaProd.add(totalVentaPres);
 
-      // ----------------------------------------------------------------
-      // 8) Crear venta + líneas (sin cambios)
-      // ----------------------------------------------------------------
       const venta = await tx.venta.create({
         data: {
           tipoComprobante,
@@ -475,9 +428,6 @@ export class VentaService {
       });
       this.logger.log('La venta es: ', venta);
 
-      // ----------------------------------------------------------------
-      // 9) Trackers (sin cambios)
-      // ----------------------------------------------------------------
       if (prodConsolidadas.length) {
         await this.tracker.trackerSalidaProductoVenta(
           tx,
@@ -513,9 +463,6 @@ export class VentaService {
         );
       }
 
-      // ----------------------------------------------------------------
-      // 10) Pago + linkear a venta (una sola vez) y fijar método real
-      // ----------------------------------------------------------------
       if (metodoPago && metodoPago !== 'CREDITO') {
         const pago = await tx.pago.create({
           data: {
@@ -544,9 +491,6 @@ export class VentaService {
         metodoReal = 'CREDITO';
       }
 
-      // ----------------------------------------------------------------
-      // 11) Caja & MF — UNA sola llamada con política correcta
-      // ----------------------------------------------------------------
       const exigirCaja = exigeCajaPorRolYMetodo(rolEjecutor, metodoReal);
       await this.cajaService.attachAndRecordSaleTx(
         tx,
