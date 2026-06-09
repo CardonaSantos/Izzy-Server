@@ -1305,7 +1305,6 @@ export class CajaService {
       });
 
       if (!turno && exigirCajaSiEfectivo) {
-        // ⛔ Sólo error si la política exige caja
         throw new BadRequestException(
           'No tienes una caja abierta en esta sucursal para registrar la venta en efectivo.',
         );

@@ -96,8 +96,6 @@ export class PrismaReglaContableRepository implements ReglaContableRepository {
     });
   }
 
-  // 🔥 MÉTODO CLAVE
-
   async findByContext(
     params: {
       origen: OrigenAsientoContable;

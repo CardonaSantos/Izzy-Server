@@ -1,4 +1,3 @@
-// prisma/seed.ts
 import { PrismaClient, TipoSucursal } from '@prisma/client';
 
 async function main() {

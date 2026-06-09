@@ -76,7 +76,6 @@ export class ReglaContableController {
     return this.service.eliminar(id);
   }
 
-  // 🔥 DEBUG / TEST DE REGLA
   @Post('resolver')
   async resolver(@Body() dto: ResolverReglaContableDto) {
     return this.service.resolverRegla(dto);

@@ -15,6 +15,7 @@ import { CreatePurchaseRequisitionDto } from './dto/create-purchase-requisition.
 import { UpdatePurchaseRequisitionDto } from './dto/update-purchase-requisition.dto';
 import { ComprasRegistrosQueryDto } from './dto/compras-registros.query.dto';
 import { RecepcionarCompraAutoDto } from './dto/compra-recepcion.dto';
+import { CreateCompraSinCargoFromRequisicionDto } from './dto/create-compra-sin-pago.dto';
 // import { CreateCompraRecepcionDto } from './dto/compra-recepcion.dto';
 
 @Controller('compra-requisicion')
@@ -57,6 +58,15 @@ export class PurchaseRequisitionsController {
       ...body,
       compraId: id,
     });
+  }
+
+  @Post('requisicion/sin-cargo/recepcionar')
+  createCompraSinCargoFromRequisicion(
+    @Body() dto: CreateCompraSinCargoFromRequisicionDto,
+  ) {
+    return this.purchaseRequisitionsService.createCompraSinCargoFromRequisicion(
+      dto,
+    );
   }
 
   @Get('get-registros-compras-con-detalle')
