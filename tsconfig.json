@@ -10,6 +10,7 @@
     "target": "ES2021",
     "sourceMap": true,
     "outDir": "./dist",
+    "types": ["node", "express", "multer"],
     "paths": {
       "*": ["./*"], // <-- ESTA ES LA MAGIA: Reemplaza al baseUrl
       "src/*": ["./src/*"], // <-- Le dice a TS dónde encontrar tus importaciones de 'src/...'

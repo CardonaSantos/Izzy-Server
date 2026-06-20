@@ -2,6 +2,7 @@ import {
   BadRequestException,
   HttpException,
   HttpStatus,
+  Inject,
   Injectable,
   InternalServerErrorException,
   Logger,
@@ -43,24 +44,49 @@ import { buildSearchForPresentacion, buildSearchForProducto } from './HELPERS';
 import { itemsBase } from './seed/utils';
 import { DeleteProductDto } from './dto/delete-dto';
 import brcrypt from 'bcryptjs';
+import {
+  DELETE_FILE_USECASE,
+  UPLOAD_FILE_USECASE,
+} from 'src/store/digital-ocean-store/tokens';
+import { UploadFileUseCase } from 'src/store/digital-ocean-store/app/upload-file.usecase';
+import { DeleteFileUseCase } from 'src/store/digital-ocean-store/app/delete-file.usecase';
 
 const INS = 'insensitive' as const;
+
+type ProductUpdateDto = {
+  nombre: string;
+  descripcion: string | null;
+  codigoProducto: string;
+  codigoProveedor: string | null;
+  stockMinimo: number | null;
+  precioCostoActual: string | null;
+  creadoPorId: number;
+  categorias: number[];
+  tipoPresentacionId: number | null;
+  precioVenta: {
+    rol: RolPrecio;
+    orden: number;
+    precio: string;
+  }[];
+  keepProductImageIds?: number[];
+};
 
 @Injectable()
 export class ProductsService {
   private readonly logger = new Logger(ProductsService.name);
   constructor(
     private readonly prisma: PrismaService,
-    private readonly cloudinaryService: CloudinaryService,
-    private readonly presentacionPrducto: PresentacionProductoService,
+
+    // DOSPACES3
+    @Inject(UPLOAD_FILE_USECASE)
+    private readonly uploadFileUseCase: UploadFileUseCase,
+
+    @Inject(DELETE_FILE_USECASE)
+    private readonly deleteFileUseCase: DeleteFileUseCase,
   ) {}
   private dec = (v: any): string => (v == null ? '0' : String(v));
 
-  async create(
-    dto: CreateNewProductDto,
-    imagenes: Express.Multer.File[],
-    presImages: Map<number, Express.Multer.File[]> = new Map(),
-  ) {
+  async create(dto: CreateNewProductDto, imagenes: Express.Multer.File[] = []) {
     try {
       const {
         codigoProducto,
@@ -71,13 +97,15 @@ export class ProductsService {
         codigoProveedor,
         descripcion,
         precioCostoActual,
-        presentaciones,
         stockMinimo,
         tipoPresentacionId,
       } = dto;
 
       return await this.prisma.$transaction(async (tx) => {
-        const dup = await tx.producto.findUnique({ where: { codigoProducto } });
+        const dup = await tx.producto.findUnique({
+          where: { codigoProducto },
+        });
+
         if (dup) {
           throw new BadRequestException(
             `Ya existe un producto con código "${codigoProducto}"`,
@@ -100,78 +128,52 @@ export class ProductsService {
               connect: categorias?.map((id) => ({ id })) ?? [],
             },
             ...(tipoPresentacionId
-              ? { tipoPresentacion: { connect: { id: tipoPresentacionId } } }
+              ? {
+                  tipoPresentacion: {
+                    connect: { id: tipoPresentacionId },
+                  },
+                }
               : {}),
           },
         });
 
-        await Promise.all(
-          (precioVenta ?? []).map((precio) =>
-            tx.precioProducto.create({
-              data: {
-                productoId: newProduct.id,
-                precio: precio.precio,
-                estado: 'APROBADO',
-                tipo: 'ESTANDAR',
-                creadoPorId,
-                fechaCreacion: new Date(),
-                orden: precio.orden,
-                rol: precio.rol,
-              },
-            }),
-          ),
-        );
-
-        // Stock mínimo de producto
-        if (stockMinimo != null) {
-          await tx.stockThreshold.create({
-            data: { productoId: newProduct.id, stockMinimo },
+        if (precioVenta?.length) {
+          await tx.precioProducto.createMany({
+            data: precioVenta.map((precio) => ({
+              productoId: newProduct.id,
+              precio: precio.precio,
+              estado: 'APROBADO',
+              tipo: 'ESTANDAR',
+              creadoPorId,
+              fechaCreacion: new Date(),
+              orden: precio.orden,
+              rol: precio.rol,
+            })),
           });
         }
 
-        // Imágenes del PRODUCTO
-        if (imagenes?.length) {
-          const uploads = await Promise.allSettled(
-            imagenes.map((file) =>
-              this.cloudinaryService.subirImagenFile(file),
-            ),
-          );
-
-          for (let idx = 0; idx < uploads.length; idx++) {
-            const r = uploads[idx];
-            const file = imagenes[idx];
-            if (r.status === 'fulfilled') {
-              const { url, public_id } = r.value;
-              await this.vincularProductoImagen(
-                tx,
-                newProduct.id,
-                url,
-                public_id,
-                file?.originalname,
-              );
-            } else {
-              this.logger.error(`Error subiendo imagen [${idx}]`, r.reason);
-            }
-          }
-        } else {
-          this.logger.debug('No hay imágenes de producto para subir/crear');
+        if (stockMinimo != null) {
+          await tx.stockThreshold.create({
+            data: {
+              productoId: newProduct.id,
+              stockMinimo,
+            },
+          });
         }
 
-        const createdPresentations = await this.presentacionPrducto.create(
-          tx,
-          presentaciones ?? [],
-          newProduct.id,
-          presImages,
-          creadoPorId,
-        );
+        await this.uploadAndSaveProductImages(tx, newProduct.id, imagenes);
 
         return {
           newProduct,
-          presentaciones: createdPresentations,
         };
       });
     } catch (error) {
       this.logger.error('Error al crear producto:', error);
+
+      if (error instanceof BadRequestException) {
+        throw error;
+      }
+
       throw new InternalServerErrorException(
         'No se pudo crear el producto y sus datos asociados',
       );
@@ -297,6 +299,36 @@ export class ProductsService {
       this.logger.error('Error en findAll productos:', error);
       throw new InternalServerErrorException('Error al obtener los productos');
     }
+  }
+
+  /**
+   * ELIMINAR IMAGEN DE PRODUCTO
+   * @param imagenId
+   * @returns
+   */
+  async eliminarImagenProducto(imagenId: number) {
+    const imagen = await this.prisma.imagenProducto.findUnique({
+      where: { id: imagenId },
+    });
+
+    if (!imagen) {
+      throw new NotFoundException('Imagen de producto no encontrada');
+    }
+
+    if (imagen.public_id) {
+      await this.deleteFileUseCase.execute({
+        key: imagen.public_id,
+      });
+    }
+
+    await this.prisma.imagenProducto.delete({
+      where: { id: imagenId },
+    });
+
+    return {
+      id: imagenId,
+      eliminado: true,
+    };
   }
 
   /**
@@ -849,8 +881,6 @@ export class ProductsService {
   }
 
   async removeImageFromProduct(publicId: string, imageId: number) {
-    console.log('el publicId es: ', publicId, ' y el imageId es: ', imageId);
-
     if (!imageId) {
       throw new MethodNotAllowedException(
         'No se ha proporcionado un ID de imagen',
@@ -859,20 +889,24 @@ export class ProductsService {
 
     if (!publicId) {
       throw new MethodNotAllowedException(
-        'No se ha proporcionado un ID de imagen',
+        'No se ha proporcionado la key de la imagen',
       );
     }
 
-    try {
-      await this.prisma.imagenProducto.delete({
-        where: {
-          id: imageId,
-        },
-      });
-      await this.cloudinaryService.BorrarImagen(publicId);
-    } catch (error) {
-      console.log(error);
-    }
+    await this.prisma.imagenProducto.delete({
+      where: {
+        id: imageId,
+      },
+    });
+
+    await this.deleteFileUseCase.execute({
+      key: publicId,
+    });
+
+    return {
+      id: imageId,
+      eliminado: true,
+    };
   }
 
   async productToCredit() {
@@ -1393,51 +1427,66 @@ export class ProductsService {
     }> = [];
 
     for (const base of itemsBase) {
-      // Idempotencia por codigoProducto
       const exists = await this.prisma.producto.findUnique({
         where: { codigoProducto: base.codigoProducto },
         select: { id: true },
       });
 
       if (exists) {
-        report.push({ codigoProducto: base.codigoProducto, status: 'skipped' });
+        report.push({
+          codigoProducto: base.codigoProducto,
+          status: 'skipped',
+        });
         continue;
       }
 
       try {
-        await this.create(
-          {
-            ...base,
-            creadoPorId,
-            precioCostoActual:
-              base.precioCostoActual != null
-                ? String(base.precioCostoActual)
-                : undefined,
-          },
-          [], // sin imágenes de PRODUCTO
-          new Map(), // sin imágenes de PRESENTACIONES
-        );
-        report.push({ codigoProducto: base.codigoProducto, status: 'created' });
-      } catch (e: any) {
+        /**
+         * Si itemsBase todavía trae "presentaciones" por herencia,
+         * las omitimos aquí para no ensuciar el DTO nuevo.
+         */
+        const { presentaciones, ...baseProducto } = base as any;
+
+        const dto: CreateNewProductDto = {
+          ...baseProducto,
+          creadoPorId,
+          descripcion: baseProducto.descripcion ?? null,
+          codigoProveedor: baseProducto.codigoProveedor ?? null,
+          stockMinimo: baseProducto.stockMinimo ?? null,
+          tipoPresentacionId: baseProducto.tipoPresentacionId ?? null,
+          categorias: baseProducto.categorias ?? [],
+          precioVenta: baseProducto.precioVenta ?? [],
+          precioCostoActual:
+            baseProducto.precioCostoActual != null
+              ? String(baseProducto.precioCostoActual)
+              : null,
+        };
+
+        await this.create(dto, []);
+
+        report.push({
+          codigoProducto: base.codigoProducto,
+          status: 'created',
+        });
+      } catch (error: any) {
         this.logger.error(
-          `Error creando ${base.codigoProducto}: ${e?.message ?? e}`,
+          `Error creando ${base.codigoProducto}: ${error?.message ?? error}`,
         );
+
         report.push({
           codigoProducto: base.codigoProducto,
           status: 'error',
-          error: e?.message ?? String(e),
+          error: error?.message ?? String(error),
         });
       }
     }
 
-    const summary = {
-      created: report.filter((r) => r.status === 'created').length,
-      skipped: report.filter((r) => r.status === 'skipped').length,
-      errors: report.filter((r) => r.status === 'error').length,
+    return {
+      created: report.filter((item) => item.status === 'created').length,
+      skipped: report.filter((item) => item.status === 'skipped').length,
+      errors: report.filter((item) => item.status === 'error').length,
       details: report,
     };
-
-    return summary;
   }
 
   //SERVICIOS DE EDICION DE PRODUCTO - GET Y PATCH
@@ -1585,119 +1634,88 @@ export class ProductsService {
   private async uploadAndSaveProductImages(
     tx: Prisma.TransactionClient,
     productoId: number,
-    files: Express.Multer.File[],
+    files: Express.Multer.File[] = [],
   ) {
-    if (!files?.length) return;
+    if (!files.length) {
+      this.logger.debug('No hay imágenes de producto para subir/crear');
+      return;
+    }
 
-    const uploads = await Promise.allSettled(
-      files.map((file) => this.cloudinaryService.subirImagenFile(file)),
+    this.logger.debug(
+      `[uploadAndSaveProductImages] Subiendo ${files.length} imagen(es) a DigitalOcean Spaces`,
     );
 
-    const ok = uploads
-      .map((r, i) => ({ r, file: files[i] }))
-      .filter(
-        (
-          x,
-        ): x is {
-          r: PromiseFulfilledResult<{ url: string; public_id: string }>;
-          file: Express.Multer.File;
-        } => x.r.status === 'fulfilled',
-      );
+    const uploads = await Promise.allSettled(
+      files.map((file) =>
+        this.uploadFileUseCase.execute({
+          buffer: file.buffer,
+          mime: file.mimetype,
+          fileName: file.originalname,
+          productoId,
+          tipo: 'IMAGEN',
+        }),
+      ),
+    );
 
-    const fail = uploads
-      .map((r, i) => ({ r, file: files[i] }))
-      .filter(
-        (x): x is { r: PromiseRejectedResult; file: Express.Multer.File } =>
-          x.r.status === 'rejected',
-      );
+    const uploadedOk: Array<{
+      uploaded: Awaited<ReturnType<UploadFileUseCase['execute']>>;
+      file: Express.Multer.File;
+    }> = [];
 
-    if (fail.length) {
-      this.logger.warn(
-        `[uploadAndSaveProductImages] ${fail.length} upload(s) fallidos: ${fail
-          .map((f) => f.file.originalname)
-          .join(', ')}`,
+    for (let index = 0; index < uploads.length; index++) {
+      const result = uploads[index];
+      const file = files[index];
+
+      if (result.status === 'fulfilled') {
+        uploadedOk.push({
+          uploaded: result.value,
+          file,
+        });
+
+        continue;
+      }
+
+      this.logger.error(
+        `[uploadAndSaveProductImages] Error subiendo ${file.originalname}`,
+        result.reason,
       );
     }
 
-    if (!ok.length) return;
+    if (!uploadedOk.length) {
+      this.logger.warn(
+        '[uploadAndSaveProductImages] Ninguna imagen pudo subirse correctamente',
+      );
+      return;
+    }
 
     try {
       await tx.imagenProducto.createMany({
-        data: ok.map(({ r, file }) => ({
+        data: uploadedOk.map(({ uploaded, file }) => ({
           productoId,
-          url: r.value.url,
-          public_id: r.value.public_id,
+          url: uploaded.cdnUrl,
+          public_id: uploaded.key,
           altTexto: file.originalname ?? null,
         })),
       });
-    } catch (e) {
-      // compensación
+
+      this.logger.debug(
+        `[uploadAndSaveProductImages] ${uploadedOk.length} imagen(es) guardadas en DB`,
+      );
+    } catch (error) {
+      this.logger.error(
+        '[uploadAndSaveProductImages] Falló el guardado en DB. Eliminando archivos ya subidos a Spaces...',
+        error,
+      );
+
       await Promise.allSettled(
-        ok.map(({ r }) =>
-          this.cloudinaryService.BorrarImagen(r.value.public_id),
+        uploadedOk.map(({ uploaded }) =>
+          this.deleteFileUseCase.execute({
+            key: uploaded.key,
+          }),
         ),
       );
-      throw e;
-    }
-  }
 
-  /** Sube imágenes de PRESENTACIÓN a Cloudinary y las persiste en Prisma. */
-  private async uploadAndSavePresentationImages(
-    tx: Prisma.TransactionClient,
-    presentacionId: number,
-    files: Express.Multer.File[],
-  ) {
-    if (!files?.length) return;
-
-    const uploads = await Promise.allSettled(
-      files.map((file) => this.cloudinaryService.subirImagenFile(file)),
-    );
-
-    const ok = uploads
-      .map((r, i) => ({ r, file: files[i] }))
-      .filter(
-        (
-          x,
-        ): x is {
-          r: PromiseFulfilledResult<{ url: string; public_id: string }>;
-          file: Express.Multer.File;
-        } => x.r.status === 'fulfilled',
-      );
-
-    const fail = uploads
-      .map((r, i) => ({ r, file: files[i] }))
-      .filter(
-        (x): x is { r: PromiseRejectedResult; file: Express.Multer.File } =>
-          x.r.status === 'rejected',
-      );
-
-    if (fail.length) {
-      this.logger.warn(
-        `[uploadAndSavePresentationImages] ${fail.length} upload(s) fallidos: ${fail
-          .map((f) => f.file.originalname)
-          .join(', ')}`,
-      );
-    }
-
-    if (!ok.length) return;
-
-    try {
-      await tx.imagenPresentacion.createMany({
-        data: ok.map(({ r, file }) => ({
-          presentacionId,
-          url: r.value.url,
-          public_id: r.value.public_id,
-          altTexto: file.originalname ?? null,
-          orden: 0,
-        })),
-      });
-    } catch (e) {
-      await Promise.allSettled(
-        ok.map(({ r }) =>
-          this.cloudinaryService.BorrarImagen(r.value.public_id),
-        ),
-      );
-      throw e;
+      throw error;
     }
   }
 
@@ -1705,78 +1723,27 @@ export class ProductsService {
 
   async update(
     productId: number,
-    dto: {
-      nombre: string;
-      descripcion: string | null;
-      codigoProducto: string;
-      codigoProveedor: string | null;
-      stockMinimo: number | null;
-      precioCostoActual: string | null;
-      creadoPorId: number;
-      categorias: number[];
-      tipoPresentacionId: number | null;
-      precioVenta: { rol: RolPrecio; orden: number; precio: string }[];
-      presentaciones: Array<{
-        id: number | null;
-        nombre: string;
-        codigoBarras?: string;
-        esDefault: boolean;
-        tipoPresentacionId: number | null;
-        costoReferencialPresentacion: string | null;
-        descripcion: string | null;
-        stockMinimo: number | null;
-        categoriaIds: number[];
-        preciosPresentacion: {
-          rol: RolPrecio;
-          orden: number;
-          precio: string;
-        }[];
-        activo?: boolean;
-      }>;
-      deletedPresentationIds?: number[];
-      keepProductImageIds?: number[];
-      keepPresentationImageIds?: Record<number, number[]>;
-    },
-    productImages: Express.Multer.File[],
-    presImagesByIndex: Map<number, Express.Multer.File[]>,
+    dto: ProductUpdateDto,
+    productImages: Express.Multer.File[] = [],
   ) {
     this.logger.log(
-      `DTO recibido para editar producto y presentacion con sus props:\n${JSON.stringify(
-        dto,
-        null,
-        2,
-      )}`,
+      `DTO recibido para editar producto:\n${JSON.stringify(dto, null, 2)}`,
     );
 
     this.logger.debug(`[update] productImages=${productImages.length}`);
-    this.logger.debug(
-      `[update] presImages indexes: ${
-        Array.from(presImagesByIndex.keys()).join(', ') || '(none)'
-      }`,
-    );
-    for (const [i, list] of presImagesByIndex) {
-      this.logger.debug(
-        `  pres[${i}] files=${list.length} -> ${list
-          .map((f) => f.originalname)
-          .join(', ')}`,
-      );
-    }
-    const keepKeys =
-      dto.keepPresentationImageIds &&
-      Object.keys(dto.keepPresentationImageIds).join(', ');
-    this.logger.debug(
-      `[update] keepPresentationImageIds keys: ${keepKeys || '(none)'}`,
-    );
 
     return this.prisma.$transaction(async (tx) => {
-      // 1) existencia
+      // 1) Validar existencia
       const exists = await tx.producto.findUnique({
         where: { id: productId },
         select: { id: true },
       });
-      if (!exists) throw new NotFoundException('Producto no encontrado');
 
-      // 2) update producto base
+      if (!exists) {
+        throw new NotFoundException('Producto no encontrado');
+      }
+
+      // 2) Actualizar producto base
       await tx.producto.update({
         where: { id: productId },
         data: {
@@ -1788,11 +1755,13 @@ export class ProductsService {
             ? Number(dto.precioCostoActual)
             : null,
           tipoPresentacionId: dto.tipoPresentacionId,
-          categorias: { set: dto.categorias.map((id) => ({ id })) },
+          categorias: {
+            set: dto.categorias.map((id) => ({ id })),
+          },
         },
       });
 
-      // 3) stockThreshold producto
+      // 3) Stock mínimo del producto
       if (dto.stockMinimo === null) {
         await tx.stockThreshold.deleteMany({
           where: { productoId: productId },
@@ -1801,6 +1770,7 @@ export class ProductsService {
         const current = await tx.stockThreshold.findFirst({
           where: { productoId: productId },
         });
+
         if (current) {
           await tx.stockThreshold.update({
             where: { id: current.id },
@@ -1808,28 +1778,35 @@ export class ProductsService {
           });
         } else {
           await tx.stockThreshold.create({
-            data: { productoId: productId, stockMinimo: dto.stockMinimo },
+            data: {
+              productoId: productId,
+              stockMinimo: dto.stockMinimo,
+            },
           });
         }
       }
 
-      // 4) precios del producto (versionado)
+      // 4) Versionar precios actuales del producto
       await tx.precioProducto.updateMany({
         where: {
           productoId: productId,
           estado: EstadoPrecio.APROBADO,
           vigenteHasta: null,
         },
-        data: { estado: EstadoPrecio.RECHAZADO, vigenteHasta: new Date() },
+        data: {
+          estado: EstadoPrecio.RECHAZADO,
+          vigenteHasta: new Date(),
+        },
       });
 
+      // 5) Crear nuevos precios aprobados
       if (dto.precioVenta?.length) {
         await tx.precioProducto.createMany({
-          data: dto.precioVenta.map((p) => ({
+          data: dto.precioVenta.map((precio) => ({
             productoId: productId,
-            rol: p.rol,
-            orden: p.orden,
-            precio: new Prisma.Decimal(p.precio),
+            rol: precio.rol,
+            orden: precio.orden,
+            precio: new Prisma.Decimal(precio.precio),
             tipo: TipoPrecio.ESTANDAR,
             estado: EstadoPrecio.APROBADO,
             vigenteDesde: new Date(),
@@ -1838,184 +1815,51 @@ export class ProductsService {
         });
       }
 
-      // 5) imágenes del producto
-      // BORRAR solo si el front envía keepProductImageIds (si no, no tocamos nada)
+      // 6) Eliminar imágenes removidas por el frontend
+      // Solo se toca si el frontend envía keepProductImageIds.
       if (Array.isArray(dto.keepProductImageIds)) {
-        const existing = await tx.imagenProducto.findMany({
+        const existingImages = await tx.imagenProducto.findMany({
           where: { productoId: productId },
-          select: { id: true, public_id: true },
+          select: {
+            id: true,
+            public_id: true,
+          },
         });
+
         const keepSet = new Set(dto.keepProductImageIds);
-        const toDelete = existing.filter((x) => !keepSet.has(x.id));
-        if (toDelete.length) {
+
+        const imagesToDelete = existingImages.filter(
+          (image) => !keepSet.has(image.id),
+        );
+
+        if (imagesToDelete.length) {
           await Promise.allSettled(
-            toDelete
-              .filter((x) => !!x.public_id)
-              .map((x) => this.cloudinaryService.BorrarImagen(x.public_id!)),
+            imagesToDelete
+              .filter((image) => Boolean(image.public_id))
+              .map((image) =>
+                this.deleteFileUseCase.execute({
+                  key: image.public_id!,
+                }),
+              ),
           );
+
           await tx.imagenProducto.deleteMany({
-            where: { id: { in: toDelete.map((x) => x.id) } },
+            where: {
+              id: {
+                in: imagesToDelete.map((image) => image.id),
+              },
+            },
           });
         }
       }
-      // subir nuevas imágenes de producto (si hay)
+
+      // 7) Subir nuevas imágenes del producto
       await this.uploadAndSaveProductImages(tx, productId, productImages);
 
-      // 6) presentaciones eliminadas (si llegan) — limpia Cloudinary y DB
-      if (dto.deletedPresentationIds?.length) {
-        const imgsToDelete = await tx.imagenPresentacion.findMany({
-          where: { presentacionId: { in: dto.deletedPresentationIds } },
-          select: { id: true, public_id: true },
-        });
-        if (imgsToDelete.length) {
-          await Promise.allSettled(
-            imgsToDelete
-              .filter((x) => !!x.public_id)
-              .map((x) => this.cloudinaryService.BorrarImagen(x.public_id!)),
-          );
-        }
-        await tx.productoPresentacion.deleteMany({
-          where: {
-            id: { in: dto.deletedPresentationIds },
-            productoId: productId,
-          },
-        });
-      }
-
-      // 7) upsert presentaciones + stock + precios + imágenes
-      const keepMap = dto.keepPresentationImageIds; // undefined => no borrar nada existente
-
-      for (let i = 0; i < (dto.presentaciones?.length ?? 0); i++) {
-        const p = dto.presentaciones[i];
-        let presId = p.id ?? null;
-
-        if (presId == null) {
-          // create
-          const created = await tx.productoPresentacion.create({
-            data: {
-              productoId: productId,
-              nombre: p.nombre,
-              codigoBarras: p.codigoBarras || null,
-              esDefault: p.esDefault,
-              tipoPresentacionId: p.tipoPresentacionId,
-              costoReferencialPresentacion: p.costoReferencialPresentacion
-                ? new Prisma.Decimal(p.costoReferencialPresentacion)
-                : null,
-              descripcion: p.descripcion,
-              activo: p.activo ?? true,
-              categorias: { connect: p.categoriaIds.map((id) => ({ id })) },
-            },
-            select: { id: true },
-          });
-          presId = created.id;
-        } else {
-          // update
-          await tx.productoPresentacion.update({
-            where: { id: presId, productoId: productId },
-            data: {
-              nombre: p.nombre,
-              codigoBarras: p.codigoBarras || null,
-              esDefault: p.esDefault,
-              tipoPresentacionId: p.tipoPresentacionId,
-              costoReferencialPresentacion: p.costoReferencialPresentacion
-                ? new Prisma.Decimal(p.costoReferencialPresentacion)
-                : null,
-              descripcion: p.descripcion,
-              activo: p.activo ?? true,
-              categorias: { set: p.categoriaIds.map((id) => ({ id })) },
-            },
-          });
-        }
-
-        // stockThresholdPresentacion
-        if (p.stockMinimo === null) {
-          await tx.stockThresholdPresentacion.deleteMany({
-            where: { presentacionId: presId },
-          });
-        } else {
-          const cur = await tx.stockThresholdPresentacion.findFirst({
-            where: { presentacionId: presId },
-          });
-          if (cur) {
-            await tx.stockThresholdPresentacion.update({
-              where: { id: cur.id },
-              data: { stockMinimo: p.stockMinimo },
-            });
-          } else {
-            await tx.stockThresholdPresentacion.create({
-              data: { presentacionId: presId, stockMinimo: p.stockMinimo },
-            });
-          }
-        }
-
-        // precios de la presentación (replace)
-        await tx.precioProducto.updateMany({
-          where: {
-            presentacionId: presId,
-            estado: EstadoPrecio.APROBADO,
-            vigenteHasta: null,
-          },
-          data: { estado: EstadoPrecio.RECHAZADO, vigenteHasta: new Date() },
-        });
-
-        if (p.preciosPresentacion?.length) {
-          await tx.precioProducto.createMany({
-            data: p.preciosPresentacion.map((pp) => ({
-              presentacionId: presId,
-              rol: pp.rol,
-              orden: pp.orden,
-              precio: new Prisma.Decimal(pp.precio),
-              tipo: TipoPrecio.ESTANDAR,
-              estado: EstadoPrecio.APROBADO,
-              vigenteDesde: new Date(),
-              vigenteHasta: null,
-            })),
-          });
-        }
-
-        // imágenes de la presentación:
-        // BORRAR solo si el front envió una entrada para este presId
-        if (keepMap && Object.prototype.hasOwnProperty.call(keepMap, presId)) {
-          const keepForThis = keepMap[presId] || []; // [] => borra todas
-          const existingImgs = await tx.imagenPresentacion.findMany({
-            where: { presentacionId: presId },
-            select: { id: true, public_id: true },
-          });
-          const keepSetPres = new Set(keepForThis);
-          const del = existingImgs.filter((img) => !keepSetPres.has(img.id));
-          if (del.length) {
-            await Promise.allSettled(
-              del
-                .filter((x) => !!x.public_id)
-                .map((x) => this.cloudinaryService.BorrarImagen(x.public_id!)),
-            );
-            await tx.imagenPresentacion.deleteMany({
-              where: { id: { in: del.map((x) => x.id) } },
-            });
-          }
-        }
-
-        // subir nuevas imágenes de esta presentación (por índice i)
-        const newFiles = presImagesByIndex.get(i) ?? [];
-        await this.uploadAndSavePresentationImages(tx, presId, newFiles);
-      }
-
-      // 8) asegurar una sola default
-      const defaults = await tx.productoPresentacion.count({
-        where: { productoId: productId, esDefault: true },
-      });
-      if (defaults > 1) {
-        const firstDefault = await tx.productoPresentacion.findFirst({
-          where: { productoId: productId, esDefault: true },
-          orderBy: { id: 'asc' },
-        });
-        await tx.productoPresentacion.updateMany({
-          where: { productoId: productId, id: { not: firstDefault?.id } },
-          data: { esDefault: false },
-        });
-      }
-
-      return { ok: true, id: productId };
+      return {
+        ok: true,
+        id: productId,
+      };
     });
   }
 }

@@ -6,8 +6,6 @@ type cloudinaryUploadResult = { url: string; public_id: string };
 
 @Injectable()
 export class CloudinaryService {
-  constructor(private readonly prisma: PrismaService) {}
-
   async subirImagenFile(
     file: Express.Multer.File,
   ): Promise<cloudinaryUploadResult> {

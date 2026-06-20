@@ -91,6 +91,7 @@ import { ReglaContableModule } from './contabilidad/regla-contable/regla-contabl
 import { CloudApiMetaModule } from './cloud-api-meta/cloud-api-meta.module';
 import { WhatsappCampaignsModule } from './whatsapp-campaigns/whatsapp-campaigns.module';
 import { WhatsappTemplateModule } from './whatsapp-template/whatsapp-template.module';
+import { DigitalOceanStorageModule } from './store/digital-ocean-store/digital-ocean-store.module';
 
 @Module({
   imports: [
@@ -184,6 +185,7 @@ import { WhatsappTemplateModule } from './whatsapp-template/whatsapp-template.mo
     CloudApiMetaModule,
     WhatsappCampaignsModule,
     WhatsappTemplateModule,
+    DigitalOceanStorageModule,
   ],
   controllers: [AppController],
   providers: [AppService, CloudinaryProvider, SaldosServiceService],
