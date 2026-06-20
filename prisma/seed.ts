@@ -5,10 +5,10 @@ async function main() {
 
   // Cambia estos datos según lo que necesites
   const data = {
-    nombre: 'Sucursal Central  II',
-    direccion: 'Av. Principal #123, Ciudad',
-    telefono: '+502 1234 5678',
-    pbx: '8000-1234',
+    nombre: 'Izzy Boutique',
+    direccion: 'Jacaltenango, Cantón Llano',
+    telefono: '8080-8080',
+    pbx: '',
     tipoSucursal: TipoSucursal.TIENDA,
     estadoOperacion: true,
   };
